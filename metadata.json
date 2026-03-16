@@ -1,0 +1,5 @@
+{
+  "name": "Pattar Bug Hunter",
+  "description": "An intelligent security auditing tool that analyzes code and websites for bugs, vulnerabilities, and performance bottlenecks using Gemini 3.1 Pro.",
+  "requestFramePermissions": []
+}
