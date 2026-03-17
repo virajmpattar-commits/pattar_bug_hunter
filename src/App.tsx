@@ -18,7 +18,12 @@ import {
   Download,
   Wifi,
   WifiOff,
-  RefreshCw
+  RefreshCw,
+  Github,
+  Folder,
+  File,
+  LogOut,
+  ChevronLeft
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { analyzeCode, fixCode, AuditResponse, ScanResult } from './services/geminiService';
@@ -39,6 +44,42 @@ const TYPE_ICONS = {
   'best-practice': CheckCircle2,
 };
 
+const cliScript = `#!/usr/bin/env python3
+import sys
+import json
+import os
+
+def main():
+    """
+    Pattar Sentinel - CLI Bridge
+    Pipes terminal output or file content into a format compatible with Pattar Bug Hunter.
+    """
+    if len(sys.argv) < 2:
+        print("Usage: cat file.js | python3 sentinel.py [language/context]")
+        sys.exit(1)
+
+    context = sys.argv[1]
+    content = sys.stdin.read()
+
+    if not content.strip():
+        print("Error: No input received from stdin.")
+        sys.exit(1)
+
+    payload = {
+        "source": "CLI_SENTINEL",
+        "context": context,
+        "data": content,
+        "timestamp": "2026-03-16T16:04:17Z"
+    }
+
+    print("\\n--- PATTAR SENTINEL PAYLOAD GENERATED ---")
+    print(json.dumps(payload, indent=2))
+    print("--- COPY ABOVE BLOB INTO PATTAR IMPORT FIELD ---")
+
+if __name__ == "__main__":
+    main()
+`;
+
 export default function App() {
   const [code, setCode] = useState('');
   const [language, setLanguage] = useState('javascript');
@@ -50,6 +91,16 @@ export default function App() {
   const [isFixing, setIsFixing] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [updateAvailable, setUpdateAvailable] = useState(false);
+  
+  // GitHub State
+  const [isGithubAuthenticated, setIsGithubAuthenticated] = useState(false);
+  const [repos, setRepos] = useState<any[]>([]);
+  const [selectedRepo, setSelectedRepo] = useState<any | null>(null);
+  const [repoContents, setRepoContents] = useState<any[]>([]);
+  const [currentPath, setCurrentPath] = useState('');
+  const [isLoadingRepos, setIsLoadingRepos] = useState(false);
+  const [isLoadingContents, setIsLoadingContents] = useState(false);
+  const [showRepoBrowser, setShowRepoBrowser] = useState(false);
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
@@ -57,6 +108,18 @@ export default function App() {
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+
+    // Check GitHub Auth Status
+    checkGithubAuth();
+
+    // Listen for OAuth success
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'GITHUB_AUTH_SUCCESS') {
+        setIsGithubAuthenticated(true);
+        fetchRepos();
+      }
+    };
+    window.addEventListener('message', handleMessage);
 
     // Check for SW updates
     if ('serviceWorker' in navigator) {
@@ -70,8 +133,93 @@ export default function App() {
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('message', handleMessage);
     };
   }, []);
+
+  const checkGithubAuth = async () => {
+    try {
+      const res = await fetch('/api/auth/github/status');
+      const data = await res.json();
+      setIsGithubAuthenticated(data.isAuthenticated);
+      if (data.isAuthenticated) {
+        fetchRepos();
+      }
+    } catch (err) {
+      console.error("Failed to check GitHub auth", err);
+    }
+  };
+
+  const handleGithubConnect = async () => {
+    try {
+      const res = await fetch('/api/auth/github/url');
+      const { url } = await res.json();
+      window.open(url, 'github_auth', 'width=600,height=700');
+    } catch (err) {
+      setError("Failed to initiate GitHub connection");
+    }
+  };
+
+  const handleGithubLogout = async () => {
+    try {
+      await fetch('/api/auth/github/logout', { method: 'POST' });
+      setIsGithubAuthenticated(false);
+      setRepos([]);
+      setSelectedRepo(null);
+      setShowRepoBrowser(false);
+    } catch (err) {
+      console.error("Logout failed", err);
+    }
+  };
+
+  const fetchRepos = async () => {
+    setIsLoadingRepos(true);
+    try {
+      const res = await fetch('/api/github/repos');
+      const data = await res.json();
+      setRepos(data);
+    } catch (err) {
+      setError("Failed to fetch repositories");
+    } finally {
+      setIsLoadingRepos(false);
+    }
+  };
+
+  const fetchContents = async (owner: string, repo: string, path: string = '') => {
+    setIsLoadingContents(true);
+    try {
+      const res = await fetch(`/api/github/repos/${owner}/${repo}/contents?path=${path}`);
+      const data = await res.json();
+      setRepoContents(Array.isArray(data) ? data : []);
+      setCurrentPath(path);
+    } catch (err) {
+      setError("Failed to fetch repository contents");
+    } finally {
+      setIsLoadingContents(false);
+    }
+  };
+
+  const handleFileSelect = async (file: any) => {
+    if (file.type === 'dir') {
+      fetchContents(selectedRepo.owner.login, selectedRepo.name, file.path);
+    } else {
+      setIsScanning(true);
+      try {
+        const res = await fetch(`/api/github/repos/${selectedRepo.owner.login}/${selectedRepo.name}/file?path=${file.path}`);
+        const content = await res.text();
+        setCode(content);
+        // Auto-detect language from extension
+        const ext = file.name.split('.').pop();
+        const langMap: any = { js: 'javascript', ts: 'javascript', py: 'python', sql: 'sql' };
+        setLanguage(langMap[ext] || 'javascript');
+        setShowRepoBrowser(false);
+      } catch (err) {
+        setError("Failed to fetch file content");
+      } finally {
+        setIsScanning(false);
+      }
+    }
+  };
 
   const runLocalHeuristics = (code: string): AuditResponse => {
     const vulnerabilities: ScanResult[] = [];
@@ -111,6 +259,47 @@ export default function App() {
         : "[OFFLINE MODE] No obvious vulnerabilities found via local heuristics. Connect to internet for deep AI analysis.",
       score: Math.max(0, 100 - (vulnerabilities.length * 20)),
       vulnerabilities
+    };
+  };
+
+  const getErrorDetails = (errMessage: string) => {
+    if (errMessage.includes('GEMINI_INVALID_KEY')) {
+      return {
+        title: 'Invalid API Key',
+        message: 'The provided Gemini API key is incorrect or has expired. Please update it in your environment settings.',
+        icon: ShieldAlert,
+        color: 'text-red-400 border-red-500/20 bg-red-500/10'
+      };
+    }
+    if (errMessage.includes('GEMINI_QUOTA_EXCEEDED')) {
+      return {
+        title: 'Quota Exceeded',
+        message: 'You have reached the rate limit for the Gemini API. Please wait a few minutes before trying again.',
+        icon: Zap,
+        color: 'text-orange-400 border-orange-500/20 bg-orange-500/10'
+      };
+    }
+    if (errMessage.includes('GEMINI_SAFETY_BLOCK')) {
+      return {
+        title: 'Safety Block',
+        message: 'The engine refused to analyze this content due to safety policy restrictions. Try a less sensitive snippet.',
+        icon: Shield,
+        color: 'text-yellow-400 border-yellow-500/20 bg-yellow-500/10'
+      };
+    }
+    if (errMessage.includes('GEMINI_PARSE_ERROR')) {
+      return {
+        title: 'Engine Desync',
+        message: 'The AI returned a malformed response. This usually happens with extremely complex or obfuscated code.',
+        icon: Bug,
+        color: 'text-zinc-400 border-zinc-500/20 bg-zinc-500/10'
+      };
+    }
+    return {
+      title: 'Analysis Failed',
+      message: errMessage.replace(/GEMINI_[A-Z_]+: /, '') || 'An unexpected error occurred during the security audit.',
+      icon: AlertCircle,
+      color: 'text-red-400 border-red-500/20 bg-red-500/10'
     };
   };
 
@@ -324,9 +513,26 @@ export default function App() {
           
           <div className="flex items-center gap-4">
             <div className="hidden md:flex items-center gap-6 text-sm font-medium text-zinc-400">
+              {isGithubAuthenticated ? (
+                <button 
+                  onClick={() => setShowRepoBrowser(true)}
+                  className="flex items-center gap-2 hover:text-[#00f2ff] transition-colors text-[#00f2ff]"
+                >
+                  <Github className="w-4 h-4" />
+                  Browse Repos
+                </button>
+              ) : (
+                <button 
+                  onClick={handleGithubConnect}
+                  className="flex items-center gap-2 hover:text-white transition-colors"
+                >
+                  <Github className="w-4 h-4" />
+                  Connect GitHub
+                </button>
+              )}
               <button 
                 onClick={handleDownloadPortable}
-                className="flex items-center gap-2 hover:text-[#00f2ff] transition-colors text-[#00f2ff]"
+                className="flex items-center gap-2 hover:text-[#00f2ff] transition-colors"
               >
                 <Download className="w-4 h-4" />
                 Download Portable
@@ -414,10 +620,17 @@ export default function App() {
           </div>
 
           {error && (
-            <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/20 flex items-start gap-3 text-red-400 text-sm">
-              <AlertCircle className="w-5 h-5 shrink-0" />
-              <p>{error}</p>
-            </div>
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              className={`p-4 rounded-xl border flex items-start gap-3 ${getErrorDetails(error).color}`}
+            >
+              {React.createElement(getErrorDetails(error).icon, { className: "w-5 h-5 shrink-0" })}
+              <div>
+                <h4 className="text-xs font-bold uppercase tracking-wider mb-1">{getErrorDetails(error).title}</h4>
+                <p className="text-xs opacity-80 leading-relaxed">{getErrorDetails(error).message}</p>
+              </div>
+            </motion.div>
           )}
         </div>
 
@@ -480,40 +693,115 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Issues List */}
+              {/* Issues List or Details Pane */}
               <div className="glass-panel rounded-2xl flex-1 flex flex-col overflow-hidden">
-                <div className="px-4 py-3 border-b border-zinc-800 bg-zinc-900/30">
-                  <h3 className="text-xs font-bold text-zinc-300 uppercase tracking-wider">Vulnerability Feed</h3>
+                <div className="px-4 py-3 border-b border-zinc-800 bg-zinc-900/30 flex items-center justify-between">
+                  <h3 className="text-xs font-bold text-zinc-300 uppercase tracking-wider">
+                    {selectedIssue ? 'Vulnerability Details' : 'Vulnerability Feed'}
+                  </h3>
+                  {selectedIssue && (
+                    <button 
+                      onClick={() => setSelectedIssue(null)}
+                      className="text-[10px] font-mono text-[#00f2ff] hover:underline flex items-center gap-1 uppercase"
+                    >
+                      <ChevronLeft className="w-3 h-3" /> Back to Feed
+                    </button>
+                  )}
                 </div>
-                <div className="flex-1 overflow-y-auto p-2 space-y-2 max-h-[500px]">
-                  {result.vulnerabilities.map((v, i) => {
-                    const Icon = TYPE_ICONS[v.type];
-                    return (
-                      <button
-                        key={i}
-                        onClick={() => setSelectedIssue(v)}
-                        className={`w-full text-left p-3 rounded-xl border transition-all flex items-start gap-3 ${
-                          selectedIssue === v 
-                            ? 'bg-zinc-800 border-zinc-700 shadow-lg' 
-                            : 'bg-transparent border-transparent hover:bg-zinc-800/50'
-                        }`}
+                
+                <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
+                  <AnimatePresence mode="wait">
+                    {!selectedIssue ? (
+                      <motion.div
+                        key="feed"
+                        initial={{ opacity: 0, x: 20 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: -20 }}
+                        className="space-y-2"
                       >
-                        <div className={`p-2 rounded-lg border ${SEVERITY_COLORS[v.severity]}`}>
-                          <Icon className="w-4 h-4" />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center justify-between mb-1">
-                            <span className="text-xs font-bold text-white truncate">{v.title}</span>
-                            <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded border uppercase ${SEVERITY_COLORS[v.severity]}`}>
-                              {v.severity}
-                            </span>
+                        {result.vulnerabilities.map((v, i) => {
+                          const Icon = TYPE_ICONS[v.type];
+                          return (
+                            <button
+                              key={i}
+                              onClick={() => setSelectedIssue(v)}
+                              className="w-full text-left p-3 rounded-xl border border-transparent hover:bg-zinc-800/50 transition-all flex items-start gap-3 group"
+                            >
+                              <div className={`p-2 rounded-lg border ${SEVERITY_COLORS[v.severity]}`}>
+                                <Icon className="w-4 h-4" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center justify-between mb-1">
+                                  <span className="text-xs font-bold text-white truncate group-hover:text-[#00f2ff] transition-colors">{v.title}</span>
+                                  <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded border uppercase ${SEVERITY_COLORS[v.severity]}`}>
+                                    {v.severity}
+                                  </span>
+                                </div>
+                                <p className="text-[11px] text-zinc-500 line-clamp-1">{v.description}</p>
+                              </div>
+                              <ChevronRight className="w-4 h-4 text-zinc-700 shrink-0 mt-2 group-hover:text-[#00f2ff] transition-all" />
+                            </button>
+                          );
+                        })}
+                      </motion.div>
+                    ) : (
+                      <motion.div
+                        key="details"
+                        initial={{ opacity: 0, x: 20 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: -20 }}
+                        className="space-y-6"
+                      >
+                        <div className="flex items-center gap-4">
+                          <div className={`p-3 rounded-2xl border ${SEVERITY_COLORS[selectedIssue.severity]}`}>
+                            {React.createElement(TYPE_ICONS[selectedIssue.type], { className: "w-6 h-6" })}
                           </div>
-                          <p className="text-[11px] text-zinc-500 line-clamp-1">{v.description}</p>
+                          <div>
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className={`text-[10px] font-mono px-2 py-0.5 rounded border uppercase ${SEVERITY_COLORS[selectedIssue.severity]}`}>
+                                {selectedIssue.severity}
+                              </span>
+                              <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">
+                                {selectedIssue.type}
+                              </span>
+                            </div>
+                            <h2 className="text-lg font-bold text-white leading-tight">{selectedIssue.title}</h2>
+                          </div>
                         </div>
-                        <ChevronRight className="w-4 h-4 text-zinc-700 shrink-0 mt-2" />
-                      </button>
-                    );
-                  })}
+
+                        <div className="space-y-5">
+                          <section>
+                            <h4 className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest mb-2 flex items-center gap-2">
+                              <Info className="w-3 h-3" /> Description
+                            </h4>
+                            <p className="text-xs text-zinc-300 leading-relaxed">
+                              {selectedIssue.description}
+                            </p>
+                          </section>
+
+                          {selectedIssue.location && (
+                            <section>
+                              <h4 className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest mb-2 flex items-center gap-2">
+                                <Code2 className="w-3 h-3" /> Location
+                              </h4>
+                              <div className="bg-zinc-950 rounded-lg p-2 border border-zinc-800 font-mono text-[10px] text-emerald-500 break-all">
+                                {selectedIssue.location}
+                              </div>
+                            </section>
+                          )}
+
+                          <section>
+                            <h4 className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest mb-2 flex items-center gap-2 text-[#00f2ff]">
+                              <CheckCircle2 className="w-3 h-3" /> Recommended Fix
+                            </h4>
+                            <div className="bg-zinc-950 rounded-lg p-3 border border-[#00f2ff]/10 text-xs text-zinc-300 leading-relaxed markdown-body">
+                              <Markdown>{selectedIssue.suggestion}</Markdown>
+                            </div>
+                          </section>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </div>
               </div>
             </motion.div>
@@ -521,89 +809,128 @@ export default function App() {
         </div>
       </main>
 
-      {/* Issue Detail Modal/Overlay */}
+      {/* GitHub Repo Browser Modal */}
       <AnimatePresence>
-        {selectedIssue && (
+        {showRepoBrowser && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
-            onClick={() => setSelectedIssue(null)}
+            onClick={() => setShowRepoBrowser(false)}
           >
             <motion.div
               initial={{ scale: 0.9, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.9, opacity: 0 }}
-              className="glass-panel rounded-3xl w-full max-w-2xl overflow-hidden shadow-2xl"
+              className="glass-panel rounded-3xl w-full max-w-4xl overflow-hidden shadow-2xl flex flex-col max-h-[80vh]"
               onClick={e => e.stopPropagation()}
             >
-              <div className={`h-2 w-full ${SEVERITY_COLORS[selectedIssue.severity].split(' ')[1]}`} />
-              
-              <div className="p-8">
-                <div className="flex items-start justify-between mb-6">
-                  <div className="flex items-center gap-4">
-                    <div className={`p-3 rounded-2xl border ${SEVERITY_COLORS[selectedIssue.severity]}`}>
-                      {React.createElement(TYPE_ICONS[selectedIssue.type], { className: "w-6 h-6" })}
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className={`text-[10px] font-mono px-2 py-0.5 rounded border uppercase ${SEVERITY_COLORS[selectedIssue.severity]}`}>
-                          {selectedIssue.severity}
-                        </span>
-                        <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">
-                          {selectedIssue.type}
-                        </span>
-                      </div>
-                      <h2 className="text-2xl font-bold text-white">{selectedIssue.title}</h2>
-                    </div>
-                  </div>
+              <div className="p-6 border-b border-zinc-800 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <Github className="w-6 h-6 text-[#00f2ff]" />
+                  <h2 className="text-xl font-bold text-white">GitHub Repository Analysis</h2>
+                </div>
+                <div className="flex items-center gap-4">
                   <button 
-                    onClick={() => setSelectedIssue(null)}
-                    className="p-2 hover:bg-zinc-800 rounded-full text-zinc-500 hover:text-white transition-colors"
+                    onClick={handleGithubLogout}
+                    className="text-[10px] font-mono text-zinc-500 hover:text-red-400 flex items-center gap-1 uppercase"
                   >
+                    <LogOut className="w-3 h-3" /> Logout
+                  </button>
+                  <button onClick={() => setShowRepoBrowser(false)} className="text-zinc-500 hover:text-white">
                     <AlertCircle className="w-6 h-6 rotate-45" />
                   </button>
                 </div>
+              </div>
 
-                <div className="space-y-6">
-                  <section>
-                    <h4 className="text-xs font-mono text-zinc-500 uppercase tracking-widest mb-3 flex items-center gap-2">
-                      <Info className="w-3 h-3" /> Description
-                    </h4>
-                    <p className="text-zinc-300 leading-relaxed">
-                      {selectedIssue.description}
-                    </p>
-                  </section>
-
-                  {selectedIssue.location && (
-                    <section>
-                      <h4 className="text-xs font-mono text-zinc-500 uppercase tracking-widest mb-3 flex items-center gap-2">
-                        <Code2 className="w-3 h-3" /> Location
-                      </h4>
-                      <div className="bg-zinc-950 rounded-xl p-3 border border-zinc-800 font-mono text-xs text-emerald-500">
-                        {selectedIssue.location}
-                      </div>
-                    </section>
+              <div className="flex-1 flex overflow-hidden">
+                {/* Repos Sidebar */}
+                <div className="w-1/3 border-r border-zinc-800 overflow-y-auto p-4 space-y-2">
+                  <h3 className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest mb-4">Your Repositories</h3>
+                  {isLoadingRepos ? (
+                    <div className="flex justify-center py-8"><Loader2 className="w-6 h-6 animate-spin text-zinc-600" /></div>
+                  ) : (
+                    repos.map(repo => (
+                      <button
+                        key={repo.id}
+                        onClick={() => {
+                          setSelectedRepo(repo);
+                          fetchContents(repo.owner.login, repo.name);
+                        }}
+                        className={`w-full text-left p-3 rounded-xl border transition-all ${
+                          selectedRepo?.id === repo.id 
+                            ? 'bg-[#00f2ff]/10 border-[#00f2ff]/20 text-[#00f2ff]' 
+                            : 'bg-transparent border-transparent hover:bg-zinc-800/50 text-zinc-400'
+                        }`}
+                      >
+                        <div className="text-xs font-bold truncate">{repo.name}</div>
+                        <div className="text-[9px] opacity-60 truncate">{repo.description || 'No description'}</div>
+                      </button>
+                    ))
                   )}
-
-                  <section>
-                    <h4 className="text-xs font-mono text-zinc-500 uppercase tracking-widest mb-3 flex items-center gap-2 text-emerald-500">
-                      <CheckCircle2 className="w-3 h-3" /> Recommended Fix
-                    </h4>
-                    <div className="bg-zinc-950 rounded-xl p-4 border border-emerald-500/20 text-zinc-300 text-sm leading-relaxed markdown-body">
-                      <Markdown>{selectedIssue.suggestion}</Markdown>
-                    </div>
-                  </section>
                 </div>
 
-                <div className="mt-8 pt-6 border-t border-zinc-800 flex justify-end">
-                  <button
-                    onClick={() => setSelectedIssue(null)}
-                    className="px-6 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-white font-bold text-sm transition-all"
-                  >
-                    Close Report
-                  </button>
+                {/* File Browser */}
+                <div className="flex-1 overflow-y-auto p-6">
+                  {selectedRepo ? (
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          {currentPath && (
+                            <button 
+                              onClick={() => {
+                                const parts = currentPath.split('/');
+                                parts.pop();
+                                fetchContents(selectedRepo.owner.login, selectedRepo.name, parts.join('/'));
+                              }}
+                              className="p-1 hover:bg-zinc-800 rounded text-zinc-400"
+                            >
+                              <ChevronLeft className="w-4 h-4" />
+                            </button>
+                          )}
+                          <h4 className="text-sm font-bold text-white truncate max-w-md">
+                            {selectedRepo.name} <span className="text-zinc-600 font-mono text-xs">/ {currentPath}</span>
+                          </h4>
+                        </div>
+                      </div>
+
+                      {isLoadingContents ? (
+                        <div className="flex justify-center py-12"><Loader2 className="w-8 h-8 animate-spin text-[#00f2ff]" /></div>
+                      ) : (
+                        <div className="grid grid-cols-1 gap-1">
+                          {repoContents.map(item => (
+                            <button
+                              key={item.sha}
+                              onClick={() => handleFileSelect(item)}
+                              className="w-full text-left p-2 rounded-lg hover:bg-zinc-800/50 flex items-center gap-3 group transition-all"
+                            >
+                              {item.type === 'dir' ? (
+                                <Folder className="w-4 h-4 text-yellow-500/60" />
+                              ) : (
+                                <File className="w-4 h-4 text-blue-500/60" />
+                              )}
+                              <span className="text-xs text-zinc-300 group-hover:text-white">{item.name}</span>
+                              {item.type === 'file' && (
+                                <span className="ml-auto text-[9px] font-mono text-zinc-600 opacity-0 group-hover:opacity-100 uppercase">Audit File</span>
+                              )}
+                            </button>
+                          ))}
+                          {repoContents.length === 0 && (
+                            <div className="text-center py-12 text-zinc-600 text-xs font-mono uppercase">Empty Directory</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="h-full flex flex-col items-center justify-center text-center">
+                      <div className="w-16 h-16 rounded-full bg-zinc-900 flex items-center justify-center mb-4">
+                        <Github className="w-8 h-8 text-zinc-700" />
+                      </div>
+                      <h3 className="text-lg font-bold text-white mb-2">Select a Repository</h3>
+                      <p className="text-zinc-500 text-xs max-w-xs">Choose a repository from the sidebar to begin auditing its source code.</p>
+                    </div>
+                  )}
                 </div>
               </div>
             </motion.div>
